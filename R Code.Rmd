@@ -1,0 +1,523 @@
+---
+title: "Challenge 3 Starter"
+author: "Emma Wang"
+---
+
+## Library
+
+```{r, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(janitor)
+library(vip)
+library(skimr)
+library(xgboost)
+library(reshape2)
+library(broom)
+library(doParallel)
+library(parallelly)
+library(magrittr)
+```
+
+
+## Data
+
+```{r}
+boston <- read_csv("boston_train.csv") %>% clean_names()
+kaggle <- read_csv("boston_holdout.csv") %>% clean_names()
+zips   <- read_csv("zips.csv") %>% clean_names()
+
+boston %>% skim()
+```
+
+## Transformation
+
+```{r}
+boston <- boston %>%
+  mutate(home_age = if_else(yr_remod > yr_built, 2020 - yr_remod, 2020 - yr_built))
+
+kaggle <- kaggle %>%
+  mutate(home_age = if_else(yr_remod > yr_built, 2020 - yr_remod, 2020 - yr_built))
+```
+
+
+
+## Histogram Target
+
+```{r}
+
+options(scipen = 999)
+ggplot(boston, aes(x = av_total)) + 
+  geom_histogram(bins = 50, col= "white") +
+  labs(title=" Sale Price")
+
+ggplot(boston, aes(x = av_total)) + 
+  geom_histogram(bins = 50, col= "white") +
+  scale_x_log10() +
+  labs(title="Histogram Log of Sale Price")
+```
+
+
+
+## Explore Numeric Predictors
+
+```{r}
+num_stat <- boston %>%
+   pivot_longer(cols = is.numeric, names_to = "column", values_to = "value") %>%
+   dplyr::select(column, value) %>%
+   group_by(column) %>%
+   summarise(count = n(),
+             val_miss = sum(is.na(value)),
+             n_dis = n_distinct(value),
+             mean = mean(value, na.rm = TRUE),
+             med = median(value, na.rm = TRUE),
+             max = max(value, na.rm = TRUE),
+             min = min(value, na.rm = TRUE),
+             std = sd(value, na.rm = TRUE)
+             )
+num_stat
+```
+
+```{R}
+histo <- boston %>%
+  select_if(is.numeric)
+
+bins = nrow(histo)^(1/3) * 2
+
+for(col in colnames(histo)){
+  histo %>%
+    ggplot(aes(!!as.name(col)))+
+    geom_histogram(bins = 42) +
+    labs(title = paste("histogram of", as.name(col)), x = as.name(col), y = "count") -> p
+  
+  print(p)
+}
+```
+
+
+## Explore Characteristic Predictors
+
+```{r}
+category_columns <- c("city_state","own_occ", "structure_class", "r_bldg_styl", "r_roof_typ", "r_ext_fin","r_bth_style", "r_kitch_style", "r_heat_typ", "r_ac", "r_ext_cnd", "r_ovrall_cnd", "r_int_cnd", "r_int_fin", "r_view","zip")
+
+for(col in category_columns){
+  boston %>%
+    count(!!as.name(col),sort=TRUE) %>% 
+    ggplot(aes(reorder(as.factor(!!as.name(col)),n), n)) + 
+    geom_col() +
+    labs(title = paste("bar chart of", as.name(col)), x = as.name(col), y = "count") +
+    coord_flip() -> b
+  
+  print(b)
+}
+```
+
+
+
+
+## Explore Numeric Relationships
+
+```{r}
+cor_matrix <- boston %>%
+  select(is.numeric) %>%
+  na.omit() %>%
+  cor()
+cor_matrix
+
+cor_matrix %>% melt() %>%
+  mutate(value = round(value,3)) %>%
+  ggplot(aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+   scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                        midpoint = 0, limit = c(-1,1), space = "Lab", 
+                        name="Pearson\nCorrelation") +
+   theme_minimal()+ 
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                    size = 10, hjust = 1))+
+   coord_fixed() +
+   geom_text(aes(Var2, Var1, label = value), color = "black", size = 1)
+
+```
+
+## Explore Categorical Relationships
+
+```{r}
+for (col in category_columns){
+  box <- boston %>%
+  ggplot(aes(x = !!as.name(col), y  = av_total)) +
+  geom_boxplot()+
+  labs(title = paste(col), x = col)
+  print(box)
+ }
+```
+
+
+## Partition PLUS K-Fold Cross Validation
+
+```{r}
+set.seed(123)
+bsplit <- initial_split(boston, prop = 0.70)
+train <- training(bsplit) 
+test  <-  testing(bsplit)
+
+kfold_splits <- vfold_cv(train, v=10)
+
+```
+
+
+## Define Recipe 
+
+```{r}
+the_recipe <-
+  recipe(av_total ~ ., data = train) %>%
+  step_rm(pid, zipcode) %>% 
+  step_impute_median(all_numeric_predictors()) %>% # missing values numeric 
+  step_novel(all_nominal_predictors()) %>% # new factor levels 
+  step_unknown(all_nominal_predictors()) %>% # missing values
+  step_scale(all_numeric_predictors()) %>% 
+  #step_other(all_nominal_predictors(),threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+## Check the recipe results m
+bake(the_recipe %>% prep(),train %>% sample_n(1000))
+
+```
+
+## Linear Reg 
+
+```{r}
+lm_model <- linear_reg(mixture=1, penalty = 0.001) %>%
+  set_engine("glm") %>%
+  set_mode("regression") 
+
+lm_wflow <-workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(lm_model) %>%
+  fit(train)
+
+tidy(lm_wflow) %>%
+  mutate_at(c("estimate", "statistic", "p.value"),round, 4)
+
+lm_wflow %>%
+  pull_workflow_fit() %>%
+  tidy()%>%
+  mutate_if(is.numeric,round,4)
+
+lm_wflow %>%
+  pull_workflow_fit() %>%
+  vip() 
+  
+bind_cols(
+  predict(lm_wflow,train, type="numeric"), train) %>% 
+  mutate(part = "train") -> score_lm_train
+
+bind_cols(
+  predict(lm_wflow,test), test) %>% mutate(part = "test") -> score_lm_test
+
+bind_rows(score_lm_train, score_lm_test) %>% 
+  group_by(part) %>% 
+  metrics(av_total,.pred) %>%
+  pivot_wider(id_cols = part, names_from = .metric, values_from = .estimate)
+
+```
+
+
+## Random Forest
+
+```{r}
+rf_model <- rand_forest(trees = tune(), min_n = tune()) %>% 
+  set_engine("ranger", importance="impurity") %>% 
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(rf_model)
+
+tune_grid <- grid_regular(trees(c(90,100)),
+                          min_n(c(8,10)),
+                          levels = 5)
+
+rf_tuning_results <- 
+  rf_workflow %>% 
+  tune_grid(
+    resamples = kfold_splits,
+    grid = tune_grid)
+
+rf_tuning_results %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3)
+
+rf_best <- rf_tuning_results %>%
+  select_best("rmse") 
+
+rf_final_wf <- 
+  rf_workflow %>% 
+  finalize_workflow(rf_best)
+
+print(rf_final_wf)
+
+rf_final_fit  <- 
+  rf_final_wf %>%
+  fit(data = train)
+
+rf_final_fit %>%
+  extract_fit_parsnip() %>%
+  vip() 
+
+options(scipen=999)
+bind_cols(
+  predict(rf_final_fit,train), train) %>% 
+  metrics(av_total,.pred)
+
+bind_cols(
+  predict(rf_final_fit,test), test) %>% 
+  metrics(av_total,.pred)
+
+```
+
+## Allow Parallel Calculation
+```{r}
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+```
+
+## XGBoost Model Building
+
+```{r}
+xgb_model <- boost_tree(trees=tune(), 
+                        learn_rate = tune(),
+                        tree_depth = tune()) %>%
+  set_engine("xgboost",
+             importance="permutation") %>%
+  set_mode("regression")
+
+xgb_wflow <-workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(xgb_model)
+
+xgb_search_res <- xgb_wflow %>%
+  tune_bayes(
+    resamples = kfold_splits,
+    initial = 5,
+    iter = 60,
+    metrics = metric_set(rmse,rsq),
+    control = control_bayes(no_improve = 20, verbose = TRUE)
+  )
+
+xgb_search_res %>%
+  collect_metrics()  %>% 
+  filter(.metric == "rmse")
+
+lowest_xgb_rmse <- xgb_search_res %>%
+  select_best("rmse")
+
+lowest_xgb_rmse
+
+xgb_wflow <- finalize_workflow(
+  xgb_wflow, lowest_xgb_rmse
+) %>% 
+  fit(train)
+
+xgb_wflow %>%
+  extract_fit_parsnip() %>%
+  vip()
+
+options(scipen=999)
+bind_cols(
+  predict(xgb_wflow,train), train) %>% 
+  metrics(av_total,.pred)
+
+bind_cols(
+  predict(xgb_wflow,test), test) %>% 
+  metrics(av_total,.pred)
+
+```
+
+
+## Best & Worst Predicitons 
+
+```{r}
+# best estimate 
+bind_cols(predict(xgb_wflow,test),test) %>%
+  mutate(error = av_total - .pred,
+         abs_error = abs(error)) %>% 
+  slice_min(order_by = abs_error,n=10) -> best_estimate 
+
+best_estimate 
+
+best_estimate %>% 
+ summarize(
+    mean(error),
+    mean(av_total),
+            mean(yr_built))
+
+# worst under-esimate 
+bind_cols(predict(xgb_wflow,test),test)%>%
+  mutate(error = av_total - .pred) %>% 
+  slice_max(order_by = error,n=10) -> underesimate
+
+underesimate 
+
+# overly simplistic evaluation 
+underesimate %>% 
+  summarize(
+    mean(error),
+    mean(av_total),
+            mean(yr_built))
+
+# worst over-estimate 
+bind_cols(predict(xgb_wflow,test),test)%>%
+  mutate(error = .pred - av_total) %>% 
+  slice_max(order_by = error,n=10) -> overesimate
+
+overesimate 
+
+# overly simplistic evaluation 
+overesimate %>% 
+  summarize(
+    mean(error),
+    mean(av_total),
+            mean(yr_built))
+```
+
+## KAGGLE 
+
+```{r}
+bind_cols(predict(xgb_wflow,kaggle),kaggle) %>%
+  select(pid,av_total = .pred) %>%
+  write_csv("xgb_prediction.csv")
+``` 
+
+
+
+
+## Owner_occ
+
+```{r}
+ownocc_recipe <- recipe(av_total ~ own_occ, data = train) %>% 
+  step_novel(all_nominal_predictors()) %>%         
+  step_unknown(all_nominal_predictors()) %>%       
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+bake(ownocc_recipe %>% prep(), train %>% sample_n(1000))
+
+ownocc_model <- linear_reg(mixture=1, penalty = 0.001) %>%
+  set_engine("glm") %>%
+  set_mode("regression") 
+
+ownocc_workflow <- workflow() %>%
+  add_recipe(ownocc_recipe) %>%
+  add_model(ownocc_model) %>%
+  fit(train)
+
+tidy(ownocc_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value < 0.05)
+
+tidy(ownocc_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value > 0.05)
+
+ownocc <- boston %>%
+  group_by(own_occ) %>% 
+  summarise(avg_av_total = mean(av_total))
+
+ownocc
+
+```
+
+
+## Year Build
+
+```{r}
+yrbuilt_recipe <- recipe(av_total ~ yr_built, data = train) %>% 
+  step_impute_median(all_numeric_predictors()) %>%         
+  step_scale(all_numeric_predictors())
+
+bake(yrbuilt_recipe %>% prep(), train %>% sample_n(1000))
+
+yrbuilt_model <- linear_reg(mixture=1, penalty = 0.001) %>%
+  set_engine("glm") %>%
+  set_mode("regression") 
+
+yrbuilt_workflow <- workflow() %>%
+  add_recipe(yrbuilt_recipe) %>%
+  add_model(yrbuilt_model) %>%
+  fit(train)
+
+tidy(yrbuilt_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value < 0.05)
+
+tidy(yrbuilt_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value > 0.05)
+
+
+yrbuilt <- boston %>%
+  mutate(decade = paste(as.integer(yr_built/10),0)) %>% 
+  group_by(decade) %>% 
+  summarise(avg_av_total = mean(av_total))
+
+yrbuilt 
+
+yrbuiltp <- yrbuilt %>%
+  ggplot(aes(x=decade, y=avg_av_total)) +
+  geom_point() +
+  labs(title = "relationship between year of building and price")
+
+yrbuiltp
+
+
+```
+
+
+## Year Remod
+
+```{r}
+yrremod_recipe <- recipe(av_total ~ yr_remod, data = train) %>% 
+  step_impute_median(all_numeric_predictors()) %>%         
+  step_scale(all_numeric_predictors())
+
+bake(yrremod_recipe %>% prep(), train %>% sample_n(1000))
+
+yrremod_model <- linear_reg(mixture=1, penalty = 0.001) %>%
+  set_engine("glm") %>%
+  set_mode("regression") 
+
+yrremod_workflow <- workflow() %>%
+  add_recipe(yrremod_recipe) %>%
+  add_model(yrremod_model) %>%
+  fit(train)
+
+tidy(yrremod_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value < 0.05)
+
+tidy(yrremod_workflow) %>%
+  mutate_if(is.numeric,round,3) %>%
+  filter(p.value > 0.05)
+
+yrremod <- boston %>%
+  mutate(remod = if_else(yr_remod > 0, "Y", "N")) %>% 
+  group_by(remod) %>% 
+  summarise(avg_av_total = mean(av_total))
+
+yrremod 
+
+yrremod1 <- boston %>%
+  filter(yr_remod > 0) %>% 
+  group_by(yr_remod) %>% 
+  summarise(avg_av_total = mean(av_total))
+
+yrremod1 
+
+yrremod1p <- yrremod1 %>%
+  ggplot(aes(x=yr_remod, y=avg_av_total)) +
+  geom_point() +
+  labs(title = "relationship between year of remodeling and price")
+
+yrremod1p
+```
